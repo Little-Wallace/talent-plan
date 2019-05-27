@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use futures::sync::mpsc::UnboundedSender;
+use futures::sync::mpsc::{unbounded, UnboundedSender};
 use futures::Future;
+use std::time::Duration;
 use labcodec;
 use labrpc::RpcFuture;
 
@@ -152,6 +153,14 @@ impl Raft {
         peer.request_vote(&args).map_err(Error::Rpc).wait()
     }
 
+    pub fn tick(&mut self) {
+        println!("tick every 100 mill");
+    }
+
+    pub fn step(&mut self, req : RaftRequest) {
+
+    }
+
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
@@ -185,16 +194,49 @@ impl Raft {
 // ```rust
 // struct Node { sender: Sender<Msg> }
 // ```
+
+use futures_cpupool::CpuPool;
+
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
+    raft : Arc<Mutex<Raft>>,
+    sender : UnboundedSender<RaftRequest>,
+    worker : CpuPool,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        Node {}
+        let instance = Arc::new(Mutex::new(raft));
+        let (sender, receiver) = unbounded();
+        let dur = Duration::from_millis(100);
+        let instance2 = instance.clone();
+        let instance3 = instance.clone();
+        // use std::thread;
+        use futures::Stream;
+        let stream =
+            receiver.for_each(move | req: RaftRequest| {
+                instance2.lock().unwrap().step(req);
+                Ok(())
+            }).map_err(move |e| debug!("raft step stopped: {:?}", e));
+        use futures_timer::Interval;
+        let stream2= Interval::new(dur)
+            .for_each(move | ()| {
+                instance3.lock().unwrap().tick();
+                Ok(())
+            })
+            .map_err(move |e| debug!("raft tick stopped: {:?}",  e));
+        let worker = CpuPool::new(1);
+        //use futures::IntoFuture;
+        worker.spawn(stream).forget();
+        worker.spawn(stream2).forget();
+        Node {
+            raft : instance.clone(),
+            sender : sender.clone(),
+            worker : worker.clone()
+        }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -225,7 +267,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        unimplemented!()
+        // unimplemented!()
+        return 0
     }
 
     /// Whether this peer believes it is the leader.
@@ -233,7 +276,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        unimplemented!()
+        // unimplemented!()
+        return false
     }
 
     /// The current state of this peer.
@@ -261,6 +305,25 @@ impl RaftService for Node {
     // example RequestVote RPC handler.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        unimplemented!()
+        // self.raft.lock().unwrap().step(RaftRequest { msg : RaftMessage::RequestVoteArgs(args), tx : tx});
+        // let (tx, rx) = channel(1);
+        use futures::oneshot;
+        let (tx_, rx_) = oneshot();
+        self.sender.unbounded_send(RaftRequest { msg : RaftMessage::RequestVoteArgs(args), tx : tx_}).unwrap();
+        // use futures::Stream;
+        return Box::new(rx_.map(| msg : RaftMessage | {
+            match msg {
+                RaftMessage::RequestVoteReply(reply) => {
+                    return reply;
+                }
+                _ => {
+                    panic!("error type")
+                }
+            }
+        }).map_err(move |e| {
+            use labrpc::Error as RpcError;
+            return RpcError::Other(String::from("xxxx"));
+        }));
+        //}).map_err() );
     }
 }
