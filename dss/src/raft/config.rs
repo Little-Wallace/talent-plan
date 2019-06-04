@@ -389,6 +389,8 @@ impl Config {
                             if let Some(old) = log.get(&cmd.command_index) {
                                 if *old != entry {
                                     // some server has already committed a different value for this entry!
+                                    println!("commit index = {:?}, server[{:?}]={:?} , while server[{:?}]={:?}",
+                                             cmd.command_index, i, entry, j, old);
                                     panic!(
                                         "commit index={:?} server={:?} {:?} != server={:?} {:?}",
                                         cmd.command_index, i, entry, j, old

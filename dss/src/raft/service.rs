@@ -90,7 +90,10 @@ pub struct AppendEntryArgs {
     #[prost(uint64, tag="5")]
     pub prev_log_term : u64,
 
-    #[prost(message, repeated, tag="6")]
+    #[prost(uint64, tag="6")]
+    pub committed : u64,
+
+    #[prost(message, repeated, tag="7")]
     pub entries : Vec<Entry>,
 
     #[prost(enumeration="MessageType")]
@@ -133,12 +136,23 @@ pub struct HardState {
 
 }
 
+#[derive(Clone, Message)]
+pub struct ProposeReply {
+
+    #[prost(uint64, tag="1")]
+    pub index : u64,
+
+    #[prost(uint64, tag="2")]
+    pub term : u64
+}
 
 pub enum RaftMessage {
     MsgRequestVoteReply(RequestVoteReply),
     MsgRequestVoteArgs(RequestVoteArgs),
     MsgAppendEntryArgs(AppendEntryArgs),
     MsgAppendEntryReply(AppendEntryReply),
+    MsgPropose(Vec<u8>),
+    MsgProposeReply(ProposeReply),
     MsgRaftTick
 }
 
@@ -206,3 +220,28 @@ impl AppendEntryArgs {
     }
 }
 
+//#[derive(Clone, Debug, PartialEq, Eq)]
+//pub enum RaftError {
+//    Timeout = 0,
+//    NoLeader = 1,
+//    Stopped = 2,
+//    Unimplemented(String),
+//    Other(String),
+//}
+//
+//use std::{error, fmt};
+//
+//impl fmt::Display for RaftError {
+//    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//        write!(f, "{:?}", self)
+//    }
+//}
+//
+//impl error::Error for RaftError {
+//    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+//        match *self {
+//            RaftError::Timeout => Some()
+//            _ => None,
+//        }
+//    }
+//}

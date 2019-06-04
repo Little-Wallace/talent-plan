@@ -314,9 +314,11 @@ fn test_rejoin_2b() {
     let leader2 = cfg.check_one_leader();
     cfg.disconnect(leader2);
 
+    println!("================disconnect new leader {}", leader2);
     // old leader connected again
     cfg.connect(leader1);
 
+    println!("================connect old leader {}", leader1);
     cfg.one(Entry { x: 104 }, 2, true);
 
     // all together now

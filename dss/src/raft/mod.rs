@@ -79,16 +79,17 @@ impl RaftLog {
         let entry = self.entries.last().unwrap();
         (entry.index, entry.term)
     }
-    pub fn append(&mut self, data : Vec<u8>, term : u64, valid : bool) -> u64 {
+
+    pub fn append(&mut self, data : Vec<u8>, term : u64, valid : bool) -> (u64, u64) {
         let (index, mut data_index) = match self.entries.last() {
-            Some(entry) => (entry.index, entry.data_index),
+            Some(entry) => (entry.index + 1, entry.data_index),
             None => (0, 0)
         };
         if valid {
             data_index = data_index + 1;
         }
         self.entries.push(Entry { term, index, data_index, valid, data});
-        data_index
+        (index, data_index)
     }
 
     pub fn append_entry(&mut self, entry : Entry) {
@@ -97,6 +98,8 @@ impl RaftLog {
             self.entries.push(entry);
         } else {
             self.entries[index] = entry;
+            self.entries.resize(index as usize + 1, Entry::default());
+            assert_eq!(index as usize + 1 , self.entries.len());
         }
     }
 
@@ -125,7 +128,7 @@ impl State {
 pub struct Peer {
     active : bool,
     next_index : u64,
-    match_index : i64,
+    match_index : u64,
 }
 
 use std::time;
@@ -149,6 +152,7 @@ pub struct Raft {
     last_heartbeat_time : time::Instant,
     last_bcast_time : time::Instant,
     election_timeout : u64,
+    apply_psm: UnboundedSender<ApplyMsg>,
     pub sender : Option<UnboundedSender<RaftRequest>>,
     pub worker : Option<CpuPool>,
     pub prev_hard_state : Option<HardState>,
@@ -186,6 +190,7 @@ impl Raft {
             last_heartbeat_time : time::Instant::now(),
             last_bcast_time : time::Instant::now(),
             election_timeout : 800 + 40 * me as u64,
+            apply_psm : apply_ch,
             sender : Option::None,
             worker : Option::None,
             prev_hard_state : Option::None,
@@ -204,6 +209,9 @@ impl Raft {
             Some(hard_state) => {
                 if hard_state.term != state.term || hard_state.vote != self.vote || hard_state.committed != self.committed {
                     hard_state.term = state.term;
+                    hard_state.committed = self.committed;
+                    hard_state.vote = self.vote;
+                    hard_state.entries = self.log.entries.clone();
                     self.persist();
                     return;
                 }
@@ -296,6 +304,7 @@ impl Raft {
             term : state.term,
             from : self.me as u64,
             to : server as u64,
+            committed : self.committed,
             msg_type : MessageType::AppendEntry as i32,
             prev_log_index,
             prev_log_term,
@@ -305,26 +314,30 @@ impl Raft {
         let f = self.clients[server].append_entries(&args).map(move |res| {
             let ret = sender.unwrap().unbounded_send(RaftRequest { msg : RaftMessage::MsgAppendEntryReply(res), tx : Option::None })
                 .map_err(|e| {
-                    println!("send append reply error");
+                    println!("send append_reply error");
                 });
         }).map_err(move |e| {
-            println!("send append entry to {} failed, {:?} ", server, e);
+            println!("send append_entry to {} failed, {:?} ", server, e);
         });
         let tmp = self.worker.as_ref();
         match tmp {
             Some(worker) => worker.spawn(f).forget(),
             None => panic!("No worker"),
         };
-        println!("start send append entry to {}", server);
+        println!("start send append_entry to {}", server);
     }
     fn send_heartbeat(&mut self, server: usize, state: &State) {
+        let prev_log_index = self.peers[server].next_index - 1;
+        let prev_log_term = self.log.get_term(prev_log_index as usize).unwrap();
+        let match_index = self.peers[server].match_index;
         let args = AppendEntryArgs {
             term : state.term,
             from : self.me as u64,
             to : server as u64,
             msg_type : MessageType::Heartbeat as i32,
-            prev_log_index : 0,
-            prev_log_term : 0,
+            prev_log_index,
+            prev_log_term,
+            committed : std::cmp::min(self.committed, match_index),
             entries : Vec::new(),
         };
         let sender = self.sender.clone();
@@ -334,7 +347,7 @@ impl Raft {
                 println!("send append reply error");
             });
         }).map_err(move |e| {
-            println!("send append entry to {} failed, {:?} ", server, e);
+            println!("send append_entry to {} failed, {:?} ", server, e);
         });
         let tmp = self.worker.as_ref();
         match tmp {
@@ -479,6 +492,7 @@ impl Raft {
         self.committed = data.committed;
         self.vote = data.vote;
         self.log.entries = data.entries.clone();
+        println!("{} recover from term {}, commited {}", self.me, state.term, self.committed);
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -517,27 +531,7 @@ impl Raft {
             Some(worker) => worker.execute(f).unwrap(),
             None => panic!("No worker"),
         };
-//        let sender2 = self.sender.clone();
-//        sender2.unwrap().unbounded_send(RaftRequest { msg : RaftMessage::MsgRaftTick, tx : Option::None}).map_err(|error| {
-//            println!("{} test send failed {:?}", self.me, error);
-//        }).unwrap();
-//
-        println!("{} start send request vote to {}", self.me, server);
-
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             Ok(())
-        //         }),
-        // );
-        // rx.wait() ...
-        // ```
+       println!("{} start send request vote to {}", self.me, server);
     }
 
     fn handle_request_vote(&mut self, args : RequestVoteArgs, sender : OneshotSender<RaftMessage>) {
@@ -556,8 +550,11 @@ impl Raft {
         let in_lease = state.leader != -1 && self.last_heartbeat_time.elapsed() < Duration::from_millis(700);
         let allow_vote = self.vote == -1 || self.vote == args.from as i32;
         if state.term > args.term {
+            println!("{} has reject request vote {} for {} because low term", self.me, args.msg_type, args.from);
             reply.accept = false;
-        } else if index > args.last_log_index || (index == args.last_log_index && term > args.term) {
+        } else if term > args.last_log_term || (term == args.last_log_term && index > args.last_log_index) {
+            println!("{} has reject request vote {} for {} because it has older log ({}, {}), while i have ({}, {})",
+                     self.me, args.msg_type, args.from, args.last_log_index, args.last_log_term, index, term);
             reply.accept = false;
         } else if args.term > state.term {
             if !in_lease {
@@ -566,6 +563,9 @@ impl Raft {
                 if args.get_msg_type() == MessageType::RequestVote {
                     self.become_role(-1, args.term, Role::Follower);
                 }
+                reply.term = args.term;
+            } else {
+                println!("{} has reject request vote {} for {} because in lease", self.me, args.msg_type, args.from);
             }
         } else {
             match state.role {
@@ -580,6 +580,10 @@ impl Raft {
                 Role::Leader =>  {
                     reply.accept = false;
                 }
+            }
+            if !reply.accept {
+                println!("{} has reject request vote {} for {} because not allow vote, my leader is {}, i vote for {}",
+                         self.me, args.msg_type, args.from, state.leader, self.vote);
             }
         }
         if reply.accept {
@@ -663,6 +667,33 @@ impl Raft {
         }
     }
 
+    fn maybe_commit(&mut self, commit : u64) {
+        if commit > self.committed {
+            println!("{} commit from {} to {}", self.me, self.committed, commit);
+            let entries = self.log.get_entries(self.committed as usize + 1);
+            for e in &entries {
+                if e.index > commit {
+                    break
+                }
+                let msg = ApplyMsg {
+                    command_valid : e.valid,
+                    command_index : e.data_index,
+                    command : e.data.clone(),
+                };
+                match self.apply_psm.unbounded_send(msg) {
+                    Ok(ret) => {
+                        println!("{} apply an entry in Entry[ index: {}, term: {}, data_index: {}, data: {:?} ]",
+                                 self.me, e.index, e.term, e.data_index, e.data);
+                        self.committed += 1;
+                    },
+                    Err(e) => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_append_entries(&mut self, args : AppendEntryArgs, sender : OneshotSender<RaftMessage>) {
         let state = self.get_state();
         let msg_type = MessageType::from_i32(args.msg_type).unwrap();
@@ -687,19 +718,27 @@ impl Raft {
         self.last_heartbeat_time = time::Instant::now();
         if msg_type == MessageType::Heartbeat {
             reply.accept = true;
+            self.maybe_commit(args.committed);
         } else if msg_type == MessageType::AppendEntry {
             let (index, term) = self.log.get_last_index_term();
-            if self.log.match_index_term(args.prev_log_index as usize, args.prev_log_term) {
+            if args.prev_log_index < self.committed {
+                reply.accept = false;
+                reply.last_matched_index = self.committed;
+            } else if self.log.match_index_term(args.prev_log_index as usize, args.prev_log_term) {
                 for entry in &args.entries {
                     self.log.append_entry(entry.clone());
+                    println!("{} append entry of ({}, {})", self.me, entry.index, entry.term);
                 }
-                match args.entries.last() {
-                    Some(last) => reply.last_matched_index = last.index,
-                    None => reply.last_matched_index = args.prev_log_index,
-                }
+                reply.last_matched_index = match args.entries.last() {
+                    Some(last) => last.index,
+                    None => args.prev_log_index,
+                };
                 reply.accept = true;
+                self.maybe_commit(std::cmp::min(args.committed, reply.last_matched_index));
             } else {
                 reply.accept = false;
+//                println!("{} prev log index {}, term {}, {}", self.me, args.prev_log_index, args.prev_log_term,
+//                         self.log.get_term(args.prev_log_index as usize).unwrap_or(1024));
                 reply.last_matched_index = args.prev_log_index - 1;
                 if args.prev_log_index > 1 + index {
                     reply.last_matched_index = index;
@@ -709,7 +748,6 @@ impl Raft {
         sender.send(RaftMessage::MsgAppendEntryReply(reply)).map_err(|e| {
             println!("send append reply error");
         }).unwrap();
-
     }
 
     fn handle_append_entries_reply(&mut self, reply : AppendEntryReply) {
@@ -717,21 +755,52 @@ impl Raft {
         if reply.term > state.term {
             self.become_role(-1, reply.term, Role::Follower);
             return;
+        } else if !state.is_leader {
+            return;
         }
         let msg_type = MessageType::from_i32(reply.msg_type).unwrap();
         let to = reply.to as usize;
         let mut peer = &mut self.peers[to];
         peer.active = true;
-        if msg_type == MessageType::AppendEntryReply {
-            if reply.accept {
-                peer.match_index = reply.last_matched_index as i64;
-            }
+        match msg_type {
+            MessageType::AppendEntryReply => {
+                if reply.accept {
+                    if peer.match_index < reply.last_matched_index {
+                        peer.match_index = reply.last_matched_index;
+                    }
+                    if peer.next_index <= peer.match_index {
+                        peer.next_index = peer.match_index + 1;
+                    }
+                    let mut peer_commits = Vec::with_capacity(self.peers.len());
+                    for i in 0..self.peers.len() {
+                        if i != self.me {
+                            peer_commits.push((self.peers[i].match_index, i));
+                        } else {
+                            peer_commits.push((self.log.entries.len() as u64, i));
+                        }
+                    }
+                    peer_commits.sort_by_key(|a| {
+                        return a.0;
+                    });
+                    self.maybe_commit(peer_commits[self.peers.len() / 2].0);
+                } else {
+                    peer.next_index = reply.last_matched_index + 1;
+                    self.send_append_entry(to, &state);
+                }
+            },
+            MessageType::HeartbeatReply => {
+                let (index, term) = self.log.get_last_index_term();
+                if peer.next_index <= index {
+                    self.send_append_entry(to, &state);
+                }
+            },
+            _ => panic!("append reply receive error msg type"),
         }
     }
 
     fn propose(&mut self, data : Vec<u8>, valid : bool, state: &State) -> u64 {
-        let data_index = self.log.append(data, state.term, valid);
-        println!("{} propose entry in term {}", state.leader, state.term);
+        let (log_index, data_index) = self.log.append(data, state.term, valid);
+        println!("{} propose append entry in index {}, term {}", state.leader, log_index, state.term);
         self.bcast_append(state);
         data_index
     }
@@ -742,9 +811,24 @@ impl Raft {
             RaftMessage::MsgRequestVoteReply(reply) => self.handle_request_vote_reply(reply),
             RaftMessage::MsgAppendEntryArgs(args) => self.handle_append_entries(args, req.tx.unwrap()),
             RaftMessage::MsgAppendEntryReply(reply) => self.handle_append_entries_reply(reply),
+            RaftMessage::MsgPropose(args) => {
+                let state = self.get_state();
+                if !state.is_leader {
+                    return;
+                }
+                let index = self.propose(args, true, &state);
+                let reply = ProposeReply {
+                    index,
+                    term : state.term,
+                };
+                req.tx.unwrap().send(RaftMessage::MsgProposeReply(reply)).map_err(|e| {
+                    println!("send propose reply error");
+                }).unwrap();
+            },
             RaftMessage::MsgRaftTick => self.tick(),
+            _ => panic!("unsupport step message")
         }
-        // self.maybe_persist();
+        self.maybe_persist();
     }
 
     pub fn get_state(&self) -> State {
@@ -822,12 +906,12 @@ impl Node {
         use futures_timer::Interval;
         let stream2 = Interval::new(dur)
             .for_each(move | ()| {
-                sender_tick.unbounded_send(RaftRequest {
+                let ret = sender_tick.unbounded_send(RaftRequest {
                     msg : RaftMessage::MsgRaftTick,
                     tx : Option::None
                 }).map_err(|_| {
                     println!("tick failed");
-                }).unwrap();
+                });
                 // println!("{} tick raft", me);
                 Ok(())
             })
@@ -866,7 +950,46 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        unimplemented!()
+        if self.sender.is_closed() {
+            return Err(Error::Rpc(RpcError::Stopped));
+        }
+
+        let state = self.get_state();
+        if !state.is_leader {
+            return Err(Error::NotLeader);
+        }
+        let (tx_, rx_) = oneshot();
+        let sender = self.sender.clone();
+        let mut data = Vec::new();
+        match labcodec::encode(command, &mut data) {
+            Ok(()) => (),
+            Err(e) => {
+                return Err(Error::Encode(e));
+            }
+        }
+        sender.unbounded_send(RaftRequest { msg : RaftMessage::MsgPropose(data), tx : Some(tx_)})
+            .map_err(|e| {
+            println!("send propose error");
+        }).unwrap();
+        let ret = rx_.map(| msg : RaftMessage | {
+            match msg {
+                RaftMessage::MsgProposeReply(reply) => {
+                    return reply;
+                }
+                _ => {
+                    panic!("error type")
+                }
+            }
+        }).map_err(move |e| {
+            return RpcError::Other(String::from("append_entries rpc failed, sender cancel"));
+        }).wait();
+        return match ret {
+            Ok(reply) => {
+                Ok((reply.index, reply.term))
+            },
+            Err(e) => Err(Error::Rpc(e))
+        };
+        // use futures::Stream;
     }
 
     /// The current term of this peer.
@@ -927,13 +1050,6 @@ impl RaftService for Node {
         println!("{} begin request vote rpc", self.me);
         let (tx_, rx_) = oneshot();
         let sender = self.sender.clone();
-        // let ret = sender.unbounded_send(RaftRequest { msg : RaftMessage::MsgRequestVoteArgs(args), tx : Some(tx_)}).map_err(|error| {
-        //    println!("send to raft thread failed {:?}", error);
-        // });
-
-        // if ret.is_err() {
-        //     println!("{} send to raft thread error.", self.me);
-        // }
 
         sender.unbounded_send(RaftRequest { msg : RaftMessage::MsgRequestVoteArgs(args), tx : Some(tx_)})
             .map_err(|e| {
