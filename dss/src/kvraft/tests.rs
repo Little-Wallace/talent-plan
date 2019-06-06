@@ -414,7 +414,6 @@ fn generic_test_linearizability(
                     while done_clients1.load(Ordering::Relaxed) == 0 {
                         let key = format!("{}", rng.gen::<usize>() % nclients);
                         let nv = format!("x {} {} y", cli, j);
-
                         let start = begin.elapsed().as_nanos() as i64;
                         let (inp, out) = if rng.gen::<usize>() % 1000 < 500 {
                             append(&cfg1, myck, &key, &nv);

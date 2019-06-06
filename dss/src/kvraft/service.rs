@@ -14,8 +14,12 @@ pub struct PutAppendRequest {
     #[prost(string, tag = "2")]
     pub value: String,
     // "Put" or "Append"
-    #[prost(enumeration = "Op", tag = "3")]
+    #[prost(enumeration = "Operator", tag = "3")]
     pub op: i32,
+
+    #[prost(uint64, tag = "4")]
+    pub req_id: u64,
+
     // You'll have to add definitions here.
 }
 
@@ -45,8 +49,10 @@ pub struct GetReply {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
-pub enum Op {
+pub enum Operator {
     Unknown = 0,
     Put = 1,
     Append = 2,
 }
+
+
