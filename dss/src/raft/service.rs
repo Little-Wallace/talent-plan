@@ -153,7 +153,8 @@ pub enum RaftMessage {
     MsgAppendEntryReply(AppendEntryReply),
     MsgPropose(Vec<u8>),
     MsgProposeReply(ProposeReply),
-    MsgRaftTick
+    MsgRaftTick,
+    MsgStop
 }
 
 // use futures::sync::mpsc::Sender;
