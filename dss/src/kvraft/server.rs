@@ -30,10 +30,11 @@ pub struct Storage {
     mp : HashMap<String, String>,
     operators : HashSet<u64>,
     callbacks : HashMap<u64, OneshotSender<ApplyResult>>,
+    max_apply_index : u64,
 }
 
 impl Storage {
-    pub fn apply(&mut self, req: PutAppendRequest, index: u64, term : u64) {
+    pub fn apply(&mut self, req: PutAppendRequest, index: u64, term : u64, me: usize) {
         let op = Operator::from_i32(req.op).unwrap();
         let key = req.key.clone();
         let value = req.value.clone();
@@ -44,10 +45,15 @@ impl Storage {
                     None => String::from("")
                 }
             },
-            Operator::Put => {
+            Operator::Put => if !self.operators.contains(&req.req_id) {
                 let i_value = value.clone();
                 self.mp.insert(key, i_value);
+                self.operators.insert(req.req_id);
+                let last_req_id = req.req_id - 2;
+                self.operators.remove(&last_req_id);
                 value
+            } else {
+                self.mp.get(&req.key).unwrap().clone()
             },
             Operator::Append => if !self.operators.contains(&req.req_id) {
                 let f_value = match self.mp.get_mut(&key) {
@@ -63,14 +69,16 @@ impl Storage {
                 self.operators.insert(req.req_id);
                 let last_req_id = req.req_id - 2;
                 self.operators.remove(&last_req_id);
+
                 f_value
             }
             else {
-                println!("============should not reach {:?} req_id: {}", req.key, req.req_id);
                 self.mp.get(&req.key).unwrap().clone()
             }
         };
-        println!("storage apply an entry of index: {}, op: {}, key: {:?}, value: {:?}, ret_value: {:?}", index, op as i32, req.key, req.value, ret_value);
+        println!("{}, storage apply an entry of index: {}, op: {}, key: {:?}, value: {:?}, ret_value: {:?}",
+                 me, index, op as i32, req.key, req.value, ret_value);
+        self.max_apply_index = index;
         match self.callbacks.remove(&index) {
             Some(sender) => {
                 let ret = ApplyResult {
@@ -85,6 +93,9 @@ impl Storage {
         }
     }
     pub fn add_sender(&mut self, index: u64, sender: OneshotSender<ApplyResult>) {
+        if self.max_apply_index >= index {
+            println!("============sender should not reach index: {}, {}", self.max_apply_index, index);
+        }
         self.callbacks.insert(index, sender);
     }
 
@@ -124,7 +135,7 @@ impl KvServer {
                         Ok(req) => {
                             println!("begin {} apply an entry of command_index: {}", me, msg.command_index);
                             let mut store = instance.lock().unwrap();
-                            store.apply(req, msg.command_index, msg.term);
+                            store.apply(req, msg.command_index, msg.term, me);
                         },
                         Err(e) => panic!("decode error")
                     }
@@ -219,9 +230,13 @@ impl KvService for Node {
     fn get(&self, arg: GetRequest) -> RpcFuture<GetReply> {
         // Your code here.
         if !self.is_leader() {
-            self.kv.storage.lock().unwrap().clear_callback();
-            return Box::new(FutureResult(Err(RpcError::Other("not leader".to_string()))));
+            return Box::new(FutureResult(Ok(GetReply {
+                    wrong_leader : true,
+                    err : String::default(),
+                    value : String::default(),
+                })));
         }
+
         let req = PutAppendRequest {
             key : arg.key.clone(),
             op : Operator::Unknown as i32,
@@ -276,8 +291,10 @@ impl KvService for Node {
     fn put_append(&self, arg: PutAppendRequest) -> RpcFuture<PutAppendReply> {
         // Your code here.
         if !self.is_leader() {
-            self.kv.storage.lock().unwrap().clear_callback();
-            return Box::new(FutureResult(Err(RpcError::Other("not leader".to_string()))));
+            return Box::new(FutureResult(Ok(PutAppendReply {
+                    wrong_leader : true,
+                    err : String::from(""),
+                })));
         }
         if self.kv.storage.lock().unwrap().operators.contains(&arg.req_id) {
             return Box::new(FutureResult(Ok(PutAppendReply {
