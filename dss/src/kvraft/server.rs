@@ -9,6 +9,7 @@ use labrpc::RpcFuture;
 use labrpc::Error as RpcError;
 use std::collections::{HashMap, HashSet};
 use crate::raft::ApplyMsg;
+use crate::raft::ApplyType;
 use crate::raft::errors::Error as RaftError;
 
 use futures_cpupool::CpuPool;
@@ -17,6 +18,7 @@ use futures::stream::Stream;
 use futures::future::Future;
 use futures_timer::Interval;
 use std::time::Duration;
+use crate::raft::service::{InstallSnapshotArgs, Snapshot};
 
 
 #[derive(Default, Clone)]
@@ -31,6 +33,7 @@ pub struct Storage {
     operators : HashSet<u64>,
     callbacks : HashMap<u64, OneshotSender<ApplyResult>>,
     max_apply_index : u64,
+    snap : Option<InstallSnapshotArgs>,
 }
 
 impl Storage {
@@ -92,10 +95,36 @@ impl Storage {
             None => ()
         }
     }
-    pub fn add_sender(&mut self, index: u64, sender: OneshotSender<ApplyResult>) {
-        if self.max_apply_index >= index {
-            println!("============sender should not reach index: {}, {}", self.max_apply_index, index);
+
+    pub fn apply_snapshot(&mut self, snap : KVSnapshot) {
+        let l = snap.kvs.len() / 2;
+        for i in 0..l {
+            self.mp.insert(snap.kvs[i * 2].clone(), snap.kvs[i * 2 + 1].clone());
         }
+        for k in snap.operators {
+            self.operators.insert(k);
+        }
+    }
+
+    pub fn make_snapshot(&mut self) -> KVSnapshot {
+        let mut mp = Vec::new();
+        let mut operators = Vec::new();
+        for (k, v) in self.mp.iter_mut() {
+            mp.push(k.clone());
+            mp.push(v.clone());
+        }
+        for k in &self.operators {
+            operators.push(k.clone());
+        }
+
+        KVSnapshot {
+            kvs: mp,
+            operators,
+        }
+    }
+
+
+    pub fn add_sender(&mut self, index: u64, sender: OneshotSender<ApplyResult>) {
         self.callbacks.insert(index, sender);
     }
 
@@ -126,31 +155,55 @@ impl KvServer {
 
         let (tx, apply_ch) = unbounded();
         let storage : Arc<Mutex<Storage>> = Arc::default();
+        let mut rf = raft::Raft::new(servers, me, persister, tx);
+        rf.maxraftstate = maxraftstate;
+        let state = rf.state.clone();
+        let node = raft::Node::new(rf);
         let instance = storage.clone();
+        let node_for_apply = node.clone();
+
         // let mut term = 0;
         let stream =
             apply_ch.for_each(move | msg: ApplyMsg| {
-                if msg.command_valid {
-                    match labcodec::decode(msg.command.as_slice()) {
-                        Ok(req) => {
-                            println!("begin {} apply an entry of command_index: {}", me, msg.command_index);
-                            let mut store = instance.lock().unwrap();
-                            store.apply(req, msg.command_index, msg.term, me);
+                    let mut store = instance.lock().unwrap();
+                    match msg.apply_type {
+                        ApplyType::ApplyMessage => if msg.command_valid {
+                            match labcodec::decode(msg.command.as_slice()) {
+                                Ok(req) => {
+                                    println!("begin {} apply an entry of command_index: {}", me, msg.command_index);
+                                    store.apply(req, msg.command_index, msg.log_term, me);
+                                },
+                                Err(e) => panic!("decode error")
+                            }
                         },
-                        Err(e) => panic!("decode error")
+                        ApplyType::ApplySnapshot => match labcodec::decode(msg.command.as_slice()) {
+                            Ok(req) => {
+                                store.apply_snapshot(req);
+                            },
+                            Err(e) => panic!("decode snapshot error")
+                        },
+                        ApplyType::MakeSnapshot => {
+                            let snap = store.make_snapshot();
+                            let mut data = Vec::new();
+                            labcodec::encode(&snap, &mut data).unwrap();
+                            let snapshot = Snapshot {
+                                last_log_term : msg.log_term,
+                                last_log_index : msg.log_index,
+                                last_command_index : msg.command_index,
+                                data
+                            };
+                            node_for_apply.advance_snapshot(snapshot);
+                        }
                     }
-                }
                 Ok(())
             }).map_err(move |e| {
                 println!("raft apply stopped: {:?}", e)
             });
 
-        let rf = raft::Raft::new(servers, me, persister, tx);
         let worker = CpuPool::new(1);
         worker.spawn(stream).forget();
-        let state = rf.state.clone();
         let instance2 = storage.clone();
-        let dur = Duration::from_millis(100);
+        let dur = Duration::from_millis(500);
         let stream2 = Interval::new(dur)
             .for_each(move | ()| {
                 if !state.lock().unwrap().is_leader {
@@ -166,7 +219,7 @@ impl KvServer {
             maxraftstate,
             worker,
             storage : storage,
-            rf: raft::Node::new(rf),
+            rf : node
         }
     }
 }

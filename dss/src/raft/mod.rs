@@ -23,11 +23,20 @@ use self::persister::*;
 use self::service::*;
 
 #[derive(Clone)]
+pub enum ApplyType {
+    ApplyMessage = 0,
+    ApplySnapshot = 1,
+    MakeSnapshot = 2,
+}
+
+#[derive(Clone)]
 pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
     pub command_index: u64,
-    pub term : u64,
+    pub apply_type : ApplyType,
+    pub log_term: u64,
+    pub log_index: u64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -55,7 +64,8 @@ pub struct State {
 
 #[derive(Default, Clone, Debug)]
 pub struct RaftLog {
-    pub entries : Vec<Entry>
+    pub entries : Vec<Entry>,
+    pub snapshot : Option<Snapshot>,
 }
 
 const TICK_INTERVAL : i32 = 40;
@@ -63,61 +73,168 @@ const TICK_INTERVAL : i32 = 40;
 impl RaftLog {
 
     pub fn get_entries(&self, since : usize) -> Vec<Entry> {
-        if since >= self.entries.len() {
-            return Vec::new();
+        match self.get_index(since).ok() {
+            Some(index) => {
+//                if self.snapshot.is_some() {
+//                    println!("get entries since {}, log len : {}. entries len: {}, entries index: {}", since, self.len(), self.entries.len(), index);
+//                }
+
+                if index >= self.entries.len() {
+                    Vec::new()
+                } else {
+                    self.entries[index..].to_vec().clone()
+                }
+            },
+            None => {
+                if self.snapshot.is_some() {
+                    println!("get entries since {}, log len : {}, get index fail", since, self.len());
+                }
+                Vec::new()
+            }
         }
-        return self.entries[since..].to_vec();
+    }
+
+    fn get_entry_term(&self, index: usize) -> Option<u64> {
+        if index >= self.entries.len() {
+            None
+        } else {
+            Some(self.entries[index].term)
+        }
     }
 
     pub fn get_term(&self, index : usize) -> Option<u64> {
-        if index < self.entries.len() {
-            Some(self.entries[index].term)
-        } else {
-            None
+        match &self.snapshot {
+            Some(snap) => {
+                let last_log_index = snap.last_log_index as usize;
+                if index < last_log_index {
+                    None
+                } else if index == last_log_index {
+                    Some(snap.last_log_term)
+                } else {
+                    let idx = index - last_log_index - 1;
+                    self.get_entry_term(idx)
+                }
+            },
+            None => {
+                self.get_entry_term(index)
+            }
+        }
+    }
+
+    pub fn get_last_command_index(&self) -> u64 {
+         match self.entries.last() {
+            Some(entry) => {
+                entry.command_index
+            },
+            None => {
+                let snap = self.snapshot.as_ref().unwrap();
+                snap.last_command_index
+            }
         }
     }
 
     pub fn get_last_index_term(&self)-> (u64, u64) {
-        let entry = self.entries.last().unwrap();
-        (entry.index, entry.term)
+        match self.entries.last() {
+            Some(entry) => {
+                (entry.index, entry.term)
+            },
+            None => {
+                let snap = self.snapshot.as_ref().unwrap();
+                (snap.last_log_index, snap.last_log_term)
+            }
+        }
     }
 
     pub fn append(&mut self, data : Vec<u8>, term : u64, valid : bool) -> (u64, u64) {
         let (index, mut data_index) = match self.entries.last() {
-            Some(entry) => (entry.index + 1, entry.data_index),
-            None => (0, 0)
+            Some(entry) => (entry.index + 1, entry.command_index),
+            None => {
+                match &self.snapshot {
+                    Some(snap) => (snap.last_log_index + 1, snap.last_command_index),
+                    None => (0, 0)
+                }
+            }
         };
         if valid {
             data_index = data_index + 1;
         }
-        self.entries.push(Entry { term, index, data_index, valid, data});
+        self.entries.push(Entry { term, index, command_index: data_index, valid, data});
         (index, data_index)
     }
+
+    fn get_index(&self, index: usize) -> Result<usize> {
+        match &self.snapshot {
+            Some(snap) => {
+                if index as u64 <= snap.last_log_index {
+                    Err(Error::ParamErr)
+                } else {
+                    Ok(index - snap.last_log_index as usize - 1)
+                }
+            },
+            None => Ok(index)
+        }
+    }
+
     pub fn has_entry(&self, entry: &Entry) -> bool {
-        entry.index < self.entries.len() as u64 && self.entries[entry.index as usize].term == entry.term
+        match self.get_index(entry.index as usize).ok() {
+            Some(index) => index < self.entries.len() && self.entries[index as usize].term == entry.term,
+            None => true,
+        }
     }
 
     pub fn append_entry(&mut self, entry: Entry) {
-        let index = entry.index as usize;
+        let index = self.get_index(entry.index as usize).unwrap();
         if index > self.entries.len() {
-            assert!(false);
+            panic!("over array")
         } else if index == self.entries.len() {
             self.entries.push(entry);
         } else {
             println!("diff term in index: {}, old term: {}, new term: {}", index, self.entries[index].term, entry.term);
             self.entries[index] = entry;
             self.entries.resize(index as usize + 1, Entry::default());
-            assert_eq!(index as usize + 1 , self.entries.len());
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.snapshot {
+            Some(snap) => snap.last_log_index as usize + self.entries.len() + 1,
+            None => self.entries.len()
         }
     }
 
 
     pub fn match_index_term(&self, index : usize, term : u64) -> bool {
-        if index >= self.entries.len() {
+        let entries_idx = match &self.snapshot {
+            Some(snap) => {
+                let last_snapshot_index = snap.last_log_index as usize;
+                if last_snapshot_index == index {
+                    return snap.last_log_term == term;
+                } else if last_snapshot_index > index {
+                    return false;
+                } else {
+                    index - last_snapshot_index
+                }
+            },
+            None => {
+                index
+            }
+        };
+        if entries_idx >= self.entries.len() {
             return false;
-        } else {
-            return self.entries[index].term == term;
         }
+        return self.entries[entries_idx].term == term;
+    }
+
+    pub fn advance_snapshot(&mut self, snap: Snapshot) {
+        let mut entries = Vec::new();
+        for e in &self.entries {
+            if e.index > snap.last_log_index {
+                entries.push(e.clone());
+            }
+        }
+        self.entries.clear();
+        self.entries = entries;
+        self.snapshot = Some(snap);
     }
 }
 
@@ -137,6 +254,7 @@ pub struct Peer {
     active : bool,
     next_index : u64,
     match_index : u64,
+    pending_snapshot: bool,
 }
 
 use std::time;
@@ -149,11 +267,10 @@ pub struct Raft {
     // this peer's index into peers[]
     me: usize,
     committed : u64,
-    stop : bool,
     vote: i32,
+    pending_snapshot : bool,
     voters: Vec<i32>,
     peers : Vec<Peer>,
-    pub state: Arc<Mutex<State>>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -163,9 +280,11 @@ pub struct Raft {
     election_timeout : u64,
     apply_psm: UnboundedSender<ApplyMsg>,
     commit_entries: Vec<ApplyMsg>,
+    pub state: Arc<Mutex<State>>,
     pub sender : Option<UnboundedSender<RaftRequest>>,
     pub worker : Option<CpuPool>,
     pub prev_hard_state : Option<HardState>,
+    pub maxraftstate : Option<usize>,
 }
 
 impl Raft {
@@ -191,8 +310,8 @@ impl Raft {
             persister,
             me,
             committed : 0,
-            stop : false,
             vote: -1,
+            pending_snapshot : false,
             clients : peers,
             peers : vec![Peer::default(); sz],
             voters : vec![0; sz],
@@ -206,6 +325,7 @@ impl Raft {
             sender : Option::None,
             worker : Option::None,
             prev_hard_state : Option::None,
+            maxraftstate : Option::None,
         };
 
         // initialize from state persisted before a crash
@@ -215,11 +335,34 @@ impl Raft {
         rf
     }
 
+    fn maybe_makesnapshot(&mut self, state_size : usize) {
+        self.maxraftstate.map(| size | {
+            if self.pending_snapshot {
+                return;
+            }
+
+            if state_size > size {
+                let msg = ApplyMsg {
+                    command_valid : false,
+                    command : Vec::default(),
+                    command_index : 0,
+                    apply_type : ApplyType::MakeSnapshot,
+                    log_index: self.committed,
+                    log_term: self.log.get_term(self.committed as usize).unwrap()
+                };
+                if self.apply_psm.unbounded_send(msg).is_ok() {
+                    self.pending_snapshot = true;
+                    println!("{} start make snapshot", self.me);
+                }
+            }
+        });
+    }
+
     fn maybe_persist(&mut self) {
         let state = self.get_state();
         match self.prev_hard_state.as_mut() {
             Some(hard_state) => {
-                if self.log.entries.len() < hard_state.entries.len() {
+                if self.log.len() < hard_state.entries.len() {
                     println!("======WARNING persist shorter entries");
                 }
                 if hard_state.term != state.term || hard_state.vote != self.vote || hard_state.committed != self.committed {
@@ -246,6 +389,7 @@ impl Raft {
                         }
                     }
                 }
+
             }
             None => {
                 let hard_state = HardState {
@@ -258,6 +402,32 @@ impl Raft {
                 self.persist();
             }
         };
+    }
+
+    fn apply_snapshot(&mut self, snap: Snapshot) {
+        let msg = ApplyMsg {
+            command_valid : false,
+            command_index : snap.last_command_index,
+            command : snap.data.clone(),
+            apply_type : ApplyType::ApplySnapshot,
+            log_term: snap.last_log_term,
+            log_index : snap.last_log_index
+        };
+        match &self.log.snapshot {
+            Some(last_snap) => {
+                if snap.last_log_index <= last_snap.last_log_index {
+                    return
+                }
+            },
+            None => ()
+        };
+        if self.apply_psm.unbounded_send(msg.clone()).is_err() {
+            return
+        }
+        if self.committed < snap.last_log_index {
+            self.committed = snap.last_log_index;
+        }
+        self.log.advance_snapshot(snap);
     }
 
     fn apply_committed_entries(&mut self) {
@@ -285,7 +455,15 @@ impl Raft {
         println!("{} sync raft log committed: {}, log length: {}, term: {}", self.me, state.committed, state.entries.len(), state.term);
         let mut data = Vec::new();
         labcodec::encode(self.prev_hard_state.as_ref().unwrap(), &mut data).unwrap();
-        self.persister.save_raft_state(data);
+        self.maybe_makesnapshot(data.len());
+        match &self.log.snapshot {
+            Some(snapshot) => {
+                let mut snap_data = Vec::new();
+                labcodec::encode(snapshot, &mut snap_data).unwrap();
+                self.persister.save_state_and_snapshot(data, snap_data);
+            },
+            None => self.persister.save_raft_state(data),
+        };
     }
 
 
@@ -324,10 +502,53 @@ impl Raft {
         }
     }
 
+    fn send_snapshot(&mut self, server: usize, snap :Snapshot, state: State) {
+        if self.peers[server].pending_snapshot {
+            println!("{} has sending snapshot to {}", self.me, server);
+            return;
+        }
+        self.peers[server].pending_snapshot = true;
+        let args = InstallSnapshotArgs {
+            term : state.term,
+            from : self.me as u64,
+            to : server as u64,
+            msg_type : MessageType::InstallSnapshot as i32,
+            snap,
+        };
+        let sender = self.sender.clone();
+        let f = self.clients[server].install_snapshot(&args).map(move |res| {
+            let ret = sender.unwrap().unbounded_send(RaftRequest { msg : RaftMessage::MsgInstallSnapshotReply(res), tx : Option::None })
+                .map_err(|e| {
+                    println!("send install_snapshot error");
+                });
+        }).map_err(move |e| {
+            println!("send install_snapshot to {} failed, {:?} ", server, e);
+        });
+        let tmp = self.worker.as_ref();
+        match tmp {
+            Some(worker) => worker.spawn(f).forget(),
+            None => (),
+        };
+
+    }
+
     fn send_append_entry(&mut self, server: usize, state: &State) {
-        let entries = self.log.get_entries(self.peers[server].next_index as usize).clone();
         let prev_log_index = self.peers[server].next_index - 1;
+        match &self.log.snapshot {
+            Some(snap) => {
+                if prev_log_index < snap.last_log_index {
+                    let sn = snap.clone();
+                    // println!("{} send snapshot ({}) to {}", self.me, snap.last_log_index, server);
+                    self.send_snapshot(server, sn, state.clone());
+                    return;
+                }
+            },
+            None => ()
+        };
+        let entries =
+            self.log.get_entries(prev_log_index as usize + 1);
         let prev_log_term = self.log.get_term(prev_log_index as usize).unwrap();
+        // println!("{} send {} to {}, which prev log index is {}, {}", self.me, entries.len(),server, prev_log_index, prev_log_term);
         let args = AppendEntryArgs {
             term : state.term,
             from : self.me as u64,
@@ -345,25 +566,23 @@ impl Raft {
                     println!("send append_reply error");
                 });
         }).map_err(move |e| {
-            println!("send append_entry to {} failed, {:?} ", server, e);
+            // println!("send append_entry to {} failed, {:?} ", server, e);
         });
         let tmp = self.worker.as_ref();
         match tmp {
             Some(worker) => worker.spawn(f).forget(),
-            None => panic!("No worker"),
+            None => (),
         };
     }
     fn send_heartbeat(&mut self, server: usize, state: &State) {
-        let prev_log_index = self.peers[server].next_index - 1;
-        let prev_log_term = self.log.get_term(prev_log_index as usize).unwrap();
         let match_index = self.peers[server].match_index;
         let args = AppendEntryArgs {
             term : state.term,
             from : self.me as u64,
             to : server as u64,
             msg_type : MessageType::Heartbeat as i32,
-            prev_log_index,
-            prev_log_term,
+            prev_log_index: 0,
+            prev_log_term : 0,
             committed : std::cmp::min(self.committed, match_index),
             entries : Vec::new(),
         };
@@ -453,6 +672,7 @@ impl Raft {
             self.voters[i] = 0;
             if r == Role::Leader {
                 self.peers[i].match_index = 0;
+                self.peers[i].pending_snapshot = false;
                 self.peers[i].next_index = 1;           // every raft instance has the same first entry
             }
         }
@@ -465,6 +685,7 @@ impl Raft {
             MessageType::PreRequestVote => MessageType::PreRequestReply,
             MessageType::AppendEntry => MessageType::AppendEntryReply,
             MessageType::Heartbeat => MessageType::HeartbeatReply,
+            MessageType::InstallSnapshot => MessageType::InstallSnapshotReply,
             _ => panic!("not a valid message type"),
         }
     }
@@ -483,6 +704,19 @@ impl Raft {
                 leader : -1,
             };
             return;
+        }
+        let snap_data = self.persister.snapshot();
+        if !snap_data.is_empty() {
+            match labcodec::decode(&snap_data) {
+                Ok(recover_snap) => {
+                    let snapshot = recover_snap;
+                    self.apply_snapshot(snapshot);
+                },
+                Err(e) => {
+                    panic!("restore snapshot error {:?}", e);
+                }
+            }
+
         }
 
         match labcodec::decode(data) {
@@ -518,21 +752,23 @@ impl Raft {
         self.committed = data.committed;
         self.vote = data.vote;
         self.log.entries = data.entries.clone();
-        println!("{} recover from commited: {}, log len: {}", self.me, self.committed, self.log.entries.len());
+        println!("{} recover from commited: {}, log len: {}", self.me, self.committed, self.log.len());
         for e in &self.log.entries {
             if e.index > self.committed {
                 break;
             }
             let msg = ApplyMsg {
-                command_index : e.data_index,
+                command_index : e.command_index,
                 command : e.data.clone(),
                 command_valid : e.valid,
-                term : e.term,
+                log_term: e.term,
+                log_index: e.index,
+                apply_type : ApplyType::ApplyMessage,
             };
             match self.apply_psm.unbounded_send(msg) {
                 Ok(ret) => {
                     println!("{} apply an entry of index: {}, term: {}, data_index: {}, data: {:?}",
-                             self.me, e.index, e.term, e.data_index, e.data);
+                             self.me, e.index, e.term, e.command_index, e.data);
                 },
                 Err(e) => {
                     break;
@@ -583,12 +819,13 @@ impl Raft {
 
     fn handle_request_vote(&mut self, args : RequestVoteArgs) -> Option<RaftMessage> {
         let state = self.get_state();
-        let msg_type = self.get_reply_type_for_request(args.get_msg_type());
+        let msg_type = MessageType::from_i32(args.msg_type).unwrap();
+        let reply_msg_type = self.get_reply_type_for_request(msg_type);
         let mut reply = RequestVoteReply {
             term : state.term,
             to : self.me as u64,
             accept : false,
-            msg_type : msg_type as i32,
+            msg_type : reply_msg_type as i32,
         };
         // println!("{}(term {}) receive RequestVote({}) for {}(term: {}) at {}",
         //         self.me, state.term, args.msg_type, args.from, args.term, self.timestamp());
@@ -607,7 +844,7 @@ impl Raft {
             if !in_lease {
                 reply.accept = true;
                 // println!("{} has access request vote {} for {} because no lease {}", self.me, args.msg_type, args.from, state.leader);
-                if args.get_msg_type() == MessageType::RequestVote {
+                if msg_type == MessageType::RequestVote {
                     self.become_role(-1, args.term, Role::Follower);
                 }
                 reply.term = args.term;
@@ -634,7 +871,7 @@ impl Raft {
             }
         }
         if reply.accept {
-            if args.get_msg_type() == MessageType::RequestVote {
+            if msg_type == MessageType::RequestVote {
                 self.last_heartbeat_time = time::Instant::now();
                 // self.state.lock().unwrap().term = args.term;
                 reply.term = args.term;
@@ -676,17 +913,18 @@ impl Raft {
         if reply.term < state.term {
             return;
         }
+        let msg_type = MessageType::from_i32(reply.msg_type).unwrap();
         match state.role {
             Role::Leader | Role::Follower => {
                 return;
             },
             Role::Candidate => {
-                if reply.get_msg_type() != MessageType::RequestVoteReply {
+                if msg_type != MessageType::RequestVoteReply {
                     return;
                 }
                 let ret = self.calculate_vote(reply.to as usize, reply.accept);
                 if ret == 1{
-                    println!("{} win the election in term {}, log: {} and become leader", self.me, state.term, self.log.entries.len());
+                    println!("{} win the election in term {}, log: {} and become leader", self.me, state.term, self.log.len());
                     let new_state = self.become_role(self.me as i32, state.term, Role::Leader);
                     self.propose(Vec::new(), false, &new_state);
                 } else if ret == -1 {
@@ -694,7 +932,7 @@ impl Raft {
                 }
             },
             Role::PreCandidate => {
-                if reply.get_msg_type() != MessageType::PreRequestReply {
+                if msg_type != MessageType::PreRequestReply {
                     return;
                 }
 
@@ -703,7 +941,7 @@ impl Raft {
                     self.campaign(MessageType::RequestVote, &state);
                 } else if ret == -1 {
                     self.become_role(-1, state.term,Role::Follower);
-                    println!("{} win the campaign at term: {}, log: {}", self.me, state.term, self.log.entries.len());
+                    println!("{} win the campaign at term: {}, log: {}", self.me, state.term, self.log.len());
                 } else {
                     return;
                 }
@@ -713,22 +951,28 @@ impl Raft {
 
     fn maybe_commit(&mut self, commit : u64) {
         if commit > self.committed {
-            println!("{} commit from {} to {}, log length: {}", self.me, self.committed, commit, self.log.entries.len());
-            let entries = self.log.get_entries(self.committed as usize + 1);
+            let entries = self.log.get_entries(self.committed as usize + 1).clone();
+//            println!("{} commit from {} to {}, log length: {}, uncommitted: {}",
+//                     self.me, self.committed, commit, self.log.len(), entries.len());
+////            if entries.is_empty() && self.log.len() as u64 > self.committed + 1 {
+//                println!("{}, snapshot len: {}, log entries: {}\n", self.me, self.log.snapshot.as_ref().unwrap().last_log_index, self.log.entries.len());
+//            }
             for e in &entries {
                 if e.index > commit {
                     break
                 }
                 let msg = ApplyMsg {
                     command_valid : e.valid,
-                    command_index : e.data_index,
+                    command_index : e.command_index,
                     command : e.data.clone(),
-                    term : e.term,
+                    log_term: e.term,
+                    log_index: e.index,
+                    apply_type : ApplyType::ApplyMessage,
                 };
                 self.commit_entries.push(msg);
                 self.committed += 1;
-                println!("{} apply an entry of index: {}, term: {}, data_index: {}, data: {:?}",
-                        self.me, e.index, e.term, e.data_index, e.data);
+//                println!("{} apply an entry of index: {}, term: {}, data_index: {}, data: {:?}",
+//                         self.me, e.index, e.term, e.command_index, e.data);
             }
         }
     }
@@ -736,7 +980,7 @@ impl Raft {
     fn handle_append_entries(&mut self, args : AppendEntryArgs) -> Option<RaftMessage> {
         let state = self.get_state();
         let msg_type = MessageType::from_i32(args.msg_type).unwrap();
-        let reply_msg_type = self.get_reply_type_for_request(args.get_msg_type());
+        let reply_msg_type = self.get_reply_type_for_request(msg_type);
         let mut reply = AppendEntryReply {
             term : args.term,
             to : self.me as u64,
@@ -748,6 +992,7 @@ impl Raft {
             reply.accept = false;
             reply.term = state.term;
             reply.last_matched_index = 0;
+            // println!("{} refuse append from {}, which term({}) is less than me({})", self.me, args.from, args.term, state.term);
             return Option::None;
         }
         if state.term < args.term || state.role != Role::Follower || state.leader != args.from as i32 {
@@ -763,27 +1008,32 @@ impl Raft {
             if args.prev_log_index < self.committed {
                 reply.accept = false;
                 reply.last_matched_index = self.committed;
-            } else if self.log.match_index_term(args.prev_log_index as usize, args.prev_log_term) {
-                let prev_len = self.log.entries.len();
-                for entry in &args.entries {
-                    if self.log.has_entry(entry) {
-                        continue;
-                    }
-                    self.log.append_entry(entry.clone());
-                }
-                reply.last_matched_index = match args.entries.last() {
-                    Some(last) => last.index,
-                    None => args.prev_log_index,
-                };
-                reply.accept = true;
-                if reply.last_matched_index < prev_len as u64 {
-                    println!("{} append entry of ({}, {})", self.me, reply.last_matched_index, prev_len);
-                }
-                self.maybe_commit(std::cmp::min(args.committed, reply.last_matched_index));
             } else {
+                match self.log.get_term(args.prev_log_index as usize) {
+                    Some(term) => {
+                        if term == args.prev_log_term {
+                            for entry in &args.entries {
+                                if self.log.has_entry(entry) {
+                                    continue;
+                                }
+                                self.log.append_entry(entry.clone());
+                            }
+                            reply.last_matched_index = match args.entries.last() {
+                                Some(last) => last.index,
+                                None => args.prev_log_index,
+                            };
+                            reply.accept = true;
+                            self.maybe_commit(std::cmp::min(args.committed, reply.last_matched_index));
+                            return Some(RaftMessage::MsgAppendEntryReply(reply));
+                        }
+                    },
+                    None => ()
+                }
+                // println!("{} miss match of ({}, {})", self.me, self.log.len(), args.prev_log_index);
+//                if self.log.len() as u64 > args.prev_log_index {
+//                    println!("term diff ({}, {}) ", self.log.get_term(args.prev_log_index as usize).unwrap(), args.prev_log_term);
+//                }
                 reply.accept = false;
-//                println!("{} prev log index {}, term {}, {}", self.me, args.prev_log_index, args.prev_log_term,
-//                         self.log.get_term(args.prev_log_index as usize).unwrap_or(1024));
                 reply.last_matched_index = args.prev_log_index - 1;
                 if args.prev_log_index > 1 + index {
                     reply.last_matched_index = index;
@@ -819,7 +1069,7 @@ impl Raft {
                         if i != self.me {
                             peer_commits.push(self.peers[i].match_index);
                         } else {
-                            peer_commits.push(self.log.entries.len() as u64 - 1);
+                            peer_commits.push(self.log.len() as u64 - 1);
                         }
                     }
                     peer_commits.sort();
@@ -838,10 +1088,11 @@ impl Raft {
                 }
             },
             MessageType::HeartbeatReply => {
-                let (index, term) = self.log.get_last_index_term();
+                let (index, _) = self.log.get_last_index_term();
                 if peer.next_index <= index {
                     self.send_append_entry(to, &state);
                 }
+                self.peers[to].pending_snapshot = false;
             },
             _ => panic!("append reply receive error msg type"),
         }
@@ -866,14 +1117,60 @@ impl Raft {
         }));
     }
 
-    pub fn step(&mut self, req : RaftRequest) {
-        if self.stop {
+    fn handle_snapshot(&mut self, args : InstallSnapshotArgs) -> Option<RaftMessage> {
+        let state = self.get_state();
+        let msg_type = MessageType::from_i32(args.msg_type).unwrap();
+        let reply_msg_type = self.get_reply_type_for_request(msg_type);
+        let mut reply = InstallSnapshotReply {
+            term : args.term,
+            to : self.me as u64,
+            accept : true,
+            msg_type : reply_msg_type as i32,
+            last_matched_index : 0,
+        };
+        if state.term > args.term {
+            return Option::None;
+        }
+        if state.term < args.term || state.role != Role::Follower || state.leader != args.from as i32 {
+            self.become_role(args.from as i32, args.term, Role::Follower);
+        }
+        self.last_heartbeat_time = time::Instant::now();
+        println!("{} apply snapshot from {} at index {}, {}", self.me, args.from, args.snap.last_log_index, args.term);
+        self.apply_snapshot(args.snap);
+        reply.last_matched_index = self.log.snapshot.as_ref().unwrap().last_log_index;
+        Some(RaftMessage::MsgInstallSnapshotReply(reply))
+    }
+
+    fn handle_snapshot_reply(&mut self, reply: InstallSnapshotReply) {
+        let state = self.get_state();
+        if reply.term > state.term {
+            self.become_role(-1, reply.term, Role::Follower);
+            return;
+        } else if !state.is_leader || reply.term < state.term {
             return;
         }
+        let msg_type = MessageType::from_i32(reply.msg_type).unwrap();
+        let to = reply.to as usize;
+        let mut peer = &mut self.peers[to];
+        peer.active = true;
+        peer.pending_snapshot = false;
+        if reply.accept {
+            if peer.next_index <= reply.last_matched_index {
+                peer.next_index = reply.last_matched_index + 1;
+            }
+            println!("{} handle snapshot apply from {} , which match {}, self.log.len {}", self.me, to, peer.next_index, self.log.len());
+            if peer.match_index < reply.last_matched_index {
+                peer.match_index = reply.last_matched_index;
+            }
+        }
+    }
+
+    pub fn step(&mut self, req : RaftRequest) -> bool {
         let ret = match req.msg {
             RaftMessage::MsgRequestVoteArgs(args) => self.handle_request_vote(args),
             RaftMessage::MsgAppendEntryArgs(args) => self.handle_append_entries(args),
             RaftMessage::MsgPropose(args) => self.handle_propose(args),
+            RaftMessage::MsgInstallSnapshotArgs(args) => self.handle_snapshot(args),
             RaftMessage::MsgAppendEntryReply(reply) => {
                 self.handle_append_entries_reply(reply);
                 Option::None
@@ -882,12 +1179,20 @@ impl Raft {
                 self.handle_request_vote_reply(reply);
                 Option::None
             },
+            RaftMessage::MsgAdvanceSnapshot(snap) => {
+                self.log.advance_snapshot(snap);
+                self.pending_snapshot = false;
+                Option::None
+            },
+            RaftMessage::MsgInstallSnapshotReply(reply) => {
+                self.handle_snapshot_reply(reply);
+                Option::None
+            }
             RaftMessage::MsgRaftTick => {
                 self.tick();
                 Option::None
             },
             RaftMessage::MsgStop => {
-                self.stop = true;
                 Option::Some(RaftMessage::MsgStop)
             },
             _ => panic!("unsupport step message")
@@ -896,11 +1201,17 @@ impl Raft {
         self.apply_committed_entries();
         match ret {
             Some(msg) => {
-                req.tx.unwrap().send(msg).map_err(|e| {
+                req.tx.unwrap().send(msg.clone()).map_err(|e| {
                     println!("send append reply error");
                 }).unwrap();
+                match &msg {
+                    RaftMessage::MsgStop => false,
+                    _ => {
+                       true
+                    }
+                }
             },
-            None => ()
+            None => true
         }
     }
 
@@ -944,7 +1255,7 @@ impl Raft {
 
 use futures_cpupool::CpuPool;
 use futures::future::Executor;
-use rand::random;
+// use rand::random;
 
 #[derive(Clone)]
 pub struct Node {
@@ -968,10 +1279,15 @@ impl Node {
         instance.sender = Some(sender.clone());
         instance.worker = Some(worker.clone());
         let state = instance.state.clone();
+        let mut run = true;
         let stream =
             receiver.for_each(move | req: RaftRequest| {
-                instance.step(req);
-                Ok(())
+                if run {
+                    if !instance.step(req) {
+                        run = false;
+                    }
+                }
+               Ok(())
             }).map_err(move |e| {
                 println!("raft step stopped: {:?}", e)
             });
@@ -1109,58 +1425,54 @@ impl Node {
 
         println!("kill raft node {}", self.me);
     }
+
+    pub fn advance_snapshot(&self, snap : Snapshot) {
+        if self.sender.is_closed() {
+            return;
+        }
+        let sender = self.sender.clone();
+        sender.unbounded_send(RaftRequest { msg : RaftMessage::MsgAdvanceSnapshot(snap), tx : Option::None}).unwrap();
+    }
+
+    fn handle_rpc<T : Send + 'static, F>(&self, msg: RaftMessage, f : F) -> RpcFuture<T>
+            where F: 'static + Send + FnOnce(RaftMessage) -> T,
+    {
+        if self.sender.is_closed() {
+            println!("{} sender is closed", self.me);
+            return Box::new(futures::future::result(Err(RpcError::Stopped)));
+        }
+        let (tx_, rx_) = oneshot();
+        let sender = self.sender.clone();
+        sender.unbounded_send(RaftRequest { msg, tx : Some(tx_)})
+            .map_err(|e| {
+                println!("send msg error");
+            }).unwrap();
+        return Box::new(rx_.map(f).map_err(move |e| {
+            return RpcError::Other(String::from("rpc failed, sender cancel"));
+        }));
+    }
 }
 
 impl RaftService for Node {
     // example RequestVote RPC handler.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
-        // Your code here (2A, 2B).
-        // self.raft.lock().unwrap().step(RaftRequest { msg : RaftMessage::RequestVoteArgs(args), tx : tx});
-        if self.sender.is_closed() {
-            println!("{} sender is closed", self.me);
-            return Box::new(futures::future::result(Err(RpcError::Stopped)));
-        }
-
-        //let rpc_cost = time::Instant::now();
-
-        // println!("{} begin request vote rpc", self.me);
-        let (tx_, rx_) = oneshot();
-        let sender = self.sender.clone();
-
-        sender.unbounded_send(RaftRequest { msg : RaftMessage::MsgRequestVoteArgs(args), tx : Some(tx_)})
-            .map_err(|e| {
-                println!("send vote reply error");
-            }).unwrap();
-        return Box::new(rx_.map( | msg : RaftMessage | {
+       return self.handle_rpc(RaftMessage::MsgRequestVoteArgs(args), | msg : RaftMessage | {
             // println!("request vote rpc run {}", rpc_cost.elapsed().as_millis());
-            match msg {
+           match msg {
                 RaftMessage::MsgRequestVoteReply(reply) => {
                     return reply;
                 }
                 _ => {
                     panic!("error type")
                 }
-            }
-        }).map_err(move |e| {
-            return RpcError::Other(String::from("request_vote rpc failed, sender cancel"));
-        }));
+           }
+        });
     }
 
     fn append_entries(&self, args: AppendEntryArgs) -> RpcFuture<AppendEntryReply> {
-        if self.sender.is_closed() {
-            return Box::new(futures::future::result(Err(RpcError::Stopped)));
-        }
-
-        let (tx_, rx_) = oneshot();
-        let sender = self.sender.clone();
-        sender.unbounded_send(RaftRequest { msg : RaftMessage::MsgAppendEntryArgs(args), tx : Some(tx_)}).map_err(|e| {
-            println!("send append reply error");
-        }).unwrap();
-        let me : i32 = random();
-        // println!("{} begin append_entries rpc", me);
-        return Box::new(rx_.map(move | msg : RaftMessage | {
-            // println!("{} end append_entries rpc", me);
-            match msg {
+        return self.handle_rpc(RaftMessage::MsgAppendEntryArgs(args),
+        |msg| {
+             match msg {
                 RaftMessage::MsgAppendEntryReply(reply) => {
                     return reply;
                 }
@@ -1168,9 +1480,22 @@ impl RaftService for Node {
                     panic!("error type")
                 }
             }
-        }).map_err(move |e| {
-            return RpcError::Other(String::from("append_entries rpc failed, sender cancel"));
-        }));
+        });
+    }
+
+    fn install_snapshot(&self, args : InstallSnapshotArgs) -> RpcFuture<InstallSnapshotReply> {
+        return self.handle_rpc(RaftMessage::MsgInstallSnapshotArgs(args),
+        |msg| {
+             match msg {
+                RaftMessage::MsgInstallSnapshotReply(reply) => {
+                    return reply;
+                }
+                _ => {
+                    panic!("error type")
+                }
+            }
+        });
+
     }
 
 //    fn test_request_vote(&mut self) {

@@ -780,14 +780,17 @@ fn test_snapshot_rpc_3b() {
 
     // a bunch of puts into the majority partition.
     cfg.partition(&[0, 1], &[2]);
+    println!("============begin partition=======");
     {
         let ck1 = cfg.make_client(&[0, 1]);
         for i in 0..50 {
             put(&cfg, &ck1, &format!("{}", i), &format!("{}", i));
+            println!("============put key {}====", i);
         }
         thread::sleep(RAFT_ELECTION_TIMEOUT);
         put(&cfg, &ck1, "b", "B");
     }
+    println!("============end partition=======");
 
     // check that the majority partition has thrown away
     // most of its log entries.

@@ -19,7 +19,6 @@ pub struct PutAppendRequest {
 
     #[prost(uint64, tag = "4")]
     pub req_id: u64,
-
     // You'll have to add definitions here.
 }
 
@@ -53,6 +52,15 @@ pub enum Operator {
     Unknown = 0,
     Put = 1,
     Append = 2,
+}
+
+#[derive(Clone, Message)]
+pub struct KVSnapshot {
+    #[prost(string, repeated, tag = "1")]
+    pub kvs: Vec<String>,
+
+    #[prost(uint64, repeated, tag = "2")]
+    pub operators: Vec<u64>,
 }
 
 

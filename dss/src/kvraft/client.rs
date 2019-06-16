@@ -119,7 +119,6 @@ impl Clerk {
             if lp_times % self.servers.len() == 0 {
                 std::thread::sleep(Duration::from_millis(1000));
             }
-            println!("{} {} put key: {} to {}", self.name, req_id, key, leader);
         }
         println!("{} end {} put key: {}", self.name, req_id, key);
         *self.leader.lock().unwrap() = leader;
